@@ -1,0 +1,51 @@
+# 编译 / 打包产物统一目录（tools/script/ 下的 已删除的 Windows 打包脚本 · 已删除的 Windows 打包脚本 · Makefile 全写这里）：
+#   modemd.exe / modemd-arm64|armv7|mipsle / mkipk_N.exe / *.ipk
+#   + ipk 展开暂存 ipk/<平台>/（已删除的 Windows 打包脚本 -KeepStaging 时才保留）
+build/
+*.exe
+
+# 便携版 zig（交叉编译 third_party/quectel-cm 与 simcom-cm 用，约 300 MB，别提交；
+# 已删除的 Windows 打包脚本 -DownloadZig 会自动下到这里）
+tools/zig/
+
+# SIMCom 的**预编译** simcom-cm 二进制不进仓库（厂商自有产物，且现在源码已经 vendored，
+# 只有源码编不出来时才退回用它）。源码在 third_party/simcom-cm/src（来源/校验见 SOURCE.md）
+third_party/simcom-cm/bins/
+
+# 早期版本把产物写在仓库根目录，这些名字留着防手滑提交
+modemd
+modemd-arm64
+modemd-armv7
+modemd-mipsle
+
+# 日志与运行时文件
+*.log
+*.pid
+modemd.log
+
+# 运行时状态（页面里改的东西 / 改配置前的备份）
+quota.json
+schedule.json
+wechat.json
+hostnic.json
+imei.json
+config.toml.bak
+# 页面上任何开关（wan_ipv6 / dial_enabled / 短信密码…）写回配置时都会留一份备份，
+# 开发用的 config.test.toml 也会被写，所以用通配点（含 config.test.toml.bak）
+*.toml.bak
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 依赖缓存
+vendor/
+
+# apk 签名私钥**不进仓库**（只留 .pub —— 设备 /etc/apk/keys/ 需要的是公钥）。
+# 私钥丢了：build\mkapk_*.exe -genkey files\apk-signing\modemd-local.rsa 重新生成，
+# 然后把新的 .pub 拷到设备（否则设备会拒绝新包）。
+files/apk-signing/*.rsa
+
+# 旧出包脚本留下的日志（现在的脚本不写它）
+ipkbuild.out

@@ -1,0 +1,88 @@
+[server]
+listen = "127.0.0.1:18080"
+# 后台热插拔巡检间隔（秒）。**插拔自动检测就靠它**。
+# 0 = 不启用后台周期任务，只在启动时发现一次模组（页面「刷新模组」只读缓存）。
+scan_interval = 1
+# WebSocket 信号推送间隔（秒）；网络/运营商状态使用下面独立的 network_interval。
+# 0 = 只推事件（新短信 / 热插拔 / 扫描完成 / 锁网变更）。没人连 /ws 时不会发任何 AT 指令。
+push_interval = 1
+# 网络制式/运营商状态查询间隔（秒）。
+network_interval = 3
+# 上行/下行速度的采样推送间隔（秒），默认 1。速度由流量计数器差分得出，
+# 单独走更短的节拍以免受 push_interval 影响。
+traffic_interval = 1
+pid_file = "modemd.pid"
+log_file = "modemd.log"
+log_level = "debug"
+auto_detect_vendor = true
+
+[serial]
+baud = 115200
+at_probe_timeout = "4s"
+cmd_timeout = "3s"
+read_stuck_threshold = "30s"
+# USB 设备刚被枚举出来后的预热等待（模组跟着路由器断电重启时要 1~2 分钟才应答 AT）。
+# 默认 "90s"；写 "0s" 关闭等待（旧行为）。
+probe_warmup = "90s"
+# 插上的已知模组如果一个串口都没交出来（OpenWrt 上常见：内核 option 驱动不认识它），
+# 是否自动 modprobe option 并写 new_id 把 /dev/ttyUSB* 补出来。默认 true。
+# ⚠️ 只在 Linux/OpenWrt 生效（Windows 的串口由驱动 inf 决定，做不到自动绑定）。
+usb_autobind = true
+
+[sms]
+send_queue_size = 16
+sms_memory = "SM"
+
+[sim]
+# SIM 热插拔：兜底轮询间隔（拔/插卡会有 +CPIN URC 立刻触发）；换卡后是否 AT+CFUN=1,1 让新卡生效。
+hotswap_interval = "20s"
+hotswap_reset = false
+
+[net]
+dial_enabled = true
+# 模组上线自动组网（OpenWrt 专用：自动拨号 + 自动建 WAN 接口与防火墙）。
+# 本机是 Windows 时是空操作；详见 config.toml 与 module/netprov/。
+auto_wan = true
+auto_dial = true
+# QMI 的主机侧拨号器由 modemd 自己托管（详见 config.toml）
+host_dial = true
+host_dial_bin = ""
+host_dial_pdn = 0
+wan_metric = 20
+wan_zone = "wan"
+# 把模组拿到的 IPv6 前缀交给内网（默认 true，见 config.toml 里的详细说明）
+lan_ipv6 = true
+
+[dial]
+# 拨号 / 写 APN 后是否顺手激活 IMS 上下文（详见 config.toml 与 module/kernel/pdp_ims.go）
+activate_ims = true
+
+[modem]
+enable_nr_signal = true
+tty_per_modem = 4
+
+[ui]
+# 短信访问密码：进「短信」页 / 调短信接口都要它（默认就是 password）。
+#   sms_password = ""            -> 不启用密码校验
+#   sms_password_required = false  -> 同样关掉密码校验
+# 也可以在切「短信」页解锁后直接改（会写回本文件，不用重启；见 module/config/config.go）。
+sms_password_required = true
+sms_password = "password"
+
+[wechat]
+# 微信机器人（腾讯 iLink Bot）：收到新短信转发到微信（协议实现 module/kernel/wechat.go）。
+# 登录在页面上扫码完成（短信页 → 微信机器人 → 扫码登录），凭据会自动写回下面两行。
+#   enabled  打开后：收到新短信就推送（开关也在页面上）
+#   to_user_id  推送目标（形如 xxxx@im.wechat）；留空则用「最近给机器人发过消息的人」
+#   template  消息模板，占位符：{modem} {number} {time} {content} {parts}
+#   listen  是否长轮询收“微信发给机器人的消息”（用来学推送目标，默认 true）
+#   allowed_senders  只接受这些发送者（逗号分隔子串，留空 = 不限制）
+enabled = true
+base_url = "https://ilinkai.weixin.qq.com"
+bot_token = "66dc84070088@im.bot:0600004f4d312769dde8ef779e90e2aa4459b0"
+bot_id = "66dc84070088@im.bot"
+bot_user_id = "o9cq802stIMFvi5LJ6sUzoHuxDa8@im.wechat"
+to_user_id = ""
+template = "📩 新短信{parts}\n模组：{modem}\n号码：{number}\n时间：{time}\n内容：{content}"
+listen = true
+allowed_senders = ""
