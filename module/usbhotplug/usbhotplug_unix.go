@@ -275,7 +275,7 @@ func usbSerialNewIDPath() (driver, path string, err error) {
 
 // Modprobe 加载内核模块（OpenWrt / 桌面 Linux 都有；失败时把 stderr 带出来）。
 func Modprobe(mod string) error {
-	cmd := exec.Command("Modprobe", mod)
+	cmd := exec.Command("modprobe", mod)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
