@@ -24,7 +24,9 @@ import (
 
 type Config struct {
 	Server struct {
-		Listen string `toml:"listen"`
+		Listen      string `toml:"listen"`
+		TLSCertFile string `toml:"tls_cert_file"`
+		TLSKeyFile  string `toml:"tls_key_file"`
 		// ScanInterval 后台热插拔巡检间隔（秒）——**插拔自动检测就靠它**。
 		// <= 0 表示不启用后台周期任务：只在启动时发现一次模组，之后不会自动发现；
 		// 页面「刷新模组」只读缓存（不再重探串口，不会枚举 / 发 AT 探测），
@@ -281,7 +283,7 @@ type Config struct {
 		// **不写配置时默认开**（用户 2026-10-06 要求：「默认打开，没有配置也是打开」）；
 		// 要关就显式写 false，或在 LuCI 的「服务控制」页把开关关掉（会写回这一行）。
 		// 打开后：静态页与 /api/version 仍放行（未登录也能看到"请先登录"的提示与版本），
-		// 127.0.0.1 免登录，这台机器上找不到 ubus（非 OpenWrt）时整体不启用。
+		// 受保护接口需要 HTTPS 和有效会话，ubus 不可用时拒绝访问。
 		RequireLuciLogin bool `toml:"require_luci_login"`
 		// RequireLuciLoginSet 配置文件里**是否显式写过** require_luci_login（运行时填，不参与 toml）。
 		// 有它才能区分「没写（= 默认开）」与「显式写 false（= 关）」—— 见 Load()。
@@ -327,7 +329,7 @@ const (
 	// DefaultListenAddr Web 界面（设备中心）的默认监听地址：`[server] listen` 不写时用它。
 	// ⚠️ 别退回“让 Addr 空着”：http.Server 的空 Addr 会落到 `:http` 也就是 80 端口。
 	// 改端口就改 toml 的 `[server] listen`，改完 **必须重启服务**。
-	DefaultListenAddr = "0.0.0.0:9527"
+	DefaultListenAddr = "127.0.0.1:9527"
 	// DefaultWeChatTemplate 新短信转发到微信时的默认文案。
 	// 占位符：{modem} {number} {time} {content} {parts}
 	// ⚠️ {parts} 只在长短信分条时非空（形如「（2/3）」），所以直接跟在标题后面。

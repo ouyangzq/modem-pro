@@ -23,7 +23,8 @@ echo "  配置：      /etc/modemd/config.toml（改完 restart 生效）"
 # 端口是可配置的（config.toml 的 [server] listen，默认 9527）⇒ 按实际配置打印
 __port=$(sed -n 's/.*listen[[:space:]]*=[[:space:]]*"[^"]*:\([0-9][0-9]*\)".*/\1/p' /etc/modemd/config.toml 2>/dev/null | head -1)
 case "$__port" in ''|*[!0-9]*) __port=9527 ;; esac
-echo "  页面：      http://<路由器地址>:$__port/   （改端口：/etc/modemd/config.toml 的 [server] listen，改完 restart）"
+echo "  页面：      配置 TLS 和非回环监听后访问 https://<路由器地址>:$__port/"
+echo "  TLS：       在 /etc/modemd/config.toml 的 [server] 设置 tls_cert_file、tls_key_file 后 restart。"
 echo "  看日志：    logread -e modemd   （或 /var/log/modemd.log）"
 echo "  串口权限：  需要能访问 /dev/ttyUSB* 或 /dev/ttyACM*（默认就是 root 运行）"
 echo ""

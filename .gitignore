@@ -13,7 +13,7 @@ tools/zig/
 third_party/simcom-cm/bins/
 
 # 早期版本把产物写在仓库根目录，这些名字留着防手滑提交
-modemd
+/modemd
 modemd-arm64
 modemd-armv7
 modemd-mipsle

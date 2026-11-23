@@ -62,6 +62,8 @@ enable_nr_signal = true
 tty_per_modem = 4
 
 [ui]
+# 本地测试环境没有 rpcd，服务仅监听回环地址。
+require_luci_login = false
 # 短信访问密码：进「短信」页 / 调短信接口都要它（默认就是 password）。
 #   sms_password = ""            -> 不启用密码校验
 #   sms_password_required = false  -> 同样关掉密码校验

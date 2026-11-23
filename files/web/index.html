@@ -1076,6 +1076,7 @@
 /* 登录表单：用原生 form（回车/按钮都走浏览器原生提交，最稳），
    在外部 flex 条里用 display:contents 把三个控件“拿”出来排版 */
 #loginBar form{display:contents}
+#loginBar [hidden]{display:none}
 </style>
 <link rel="stylesheet" href="/layouts/standard.css">
 <link rel="stylesheet" href="/layouts/outline.css">
@@ -1090,13 +1091,14 @@
      所以本页用的是**同一套路由器账号**：密码交给 rpcd 验（`session login`），拿到真实会话
      存进 modemd_sess cookie ⇒ 与 LuCI 同一个会话表，在 LuCI 里退出/过期这边立刻失效。 -->
 <div id="loginBar" hidden>
-  <b>需要登录</b>
-  <span>本页接口跟随路由器账号：请用<b>路由器管理员账号</b>登录（与 LuCI 同一个密码）。</span>
+  <b id="loginHeading">需要登录</b>
+  <span id="loginHelp">本页接口跟随路由器账号：请用<b>路由器管理员账号</b>登录（与 LuCI 同一个密码）。</span>
   <form id="loginForm" autocomplete="on">
     <input id="loginUser" type="text" value="root" autocomplete="username" aria-label="用户名" style="width:110px">
     <input id="loginPass" type="password" placeholder="路由器密码" autocomplete="current-password" aria-label="密码" style="width:170px">
     <button class="act" id="loginBtn" type="submit">登录</button>
   </form>
+  <span id="loginHTTPSHelp" hidden>请通过 HTTPS 访问设备中心。</span>
   <button class="act ghost" id="loginLuci" type="button" title="在新标签页打开路由器管理页（LuCI）">去 LuCI</button>
 </div>
 <!-- 顶栏（logo 那栏）和页签菜单包成一个 sticky 块：一起钉在顶部、永不移动，
@@ -2273,6 +2275,12 @@ let loginURL = '/cgi-bin/luci/';
 function onNeedLogin(info) {
   info = info || {};
   if (info.login_url) loginURL = info.login_url;
+  const useHTTPS = location.protocol === 'https:';
+  $('#loginHeading').textContent = useHTTPS ? '需要登录' : '需要 HTTPS';
+  $('#loginHelp').hidden = !useHTTPS;
+  $('#loginForm').hidden = !useHTTPS;
+  $('#loginLuci').hidden = !useHTTPS;
+  $('#loginHTTPSHelp').hidden = useHTTPS;
   const bar = $('#loginBar');
   if (bar && bar.hidden) {
     bar.hidden = false;
@@ -2299,6 +2307,7 @@ function isAuthFreePath(path) {
 
 // doLogin：拿路由器账号密码换会话（成功后就地重载，省得一处一处重新拉数据）
 async function doLogin() {
+  if (location.protocol !== 'https:') return;
   const btn = $('#loginBtn');
   const u = (($('#loginUser') || {}).value || '').trim() || 'root';
   const p = (($('#loginPass') || {}).value || '');
@@ -2331,7 +2340,7 @@ async function api(path, opts) {
   catch { throw new Error('非 JSON 响应: ' + text.slice(0, 200)); }
   // 401 有两个来源，靠字段区分：need_login = 要求先登录路由器（LuCI 会话），
   // code=401 = 短信页要密码（走原来的锁屏逻辑）。
-  if (res.status === 401 || body.need_login) {
+  if (res.status === 401 || body.need_login || body.need_https) {
     onNeedLogin(body);
     throw new Error(body.msg || '需要登录：请用路由器管理员账号');
   }
@@ -2356,7 +2365,7 @@ async function postFull(path, obj) {
   if (smsTok) headers['X-SMS-Token'] = smsTok;
   const res = await fetch(path, { method: 'POST', headers: headers, body: JSON.stringify(obj) });
   const body = await res.json();
-  if (res.status === 401 || body.need_login) {
+  if (res.status === 401 || body.need_login || body.need_https) {
     onNeedLogin(body);
     throw new Error(body.msg || '需要登录：请用路由器管理员账号');
   }

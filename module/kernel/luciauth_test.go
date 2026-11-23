@@ -5,7 +5,7 @@ package kernel
 // 为什么这些用例重要：这道闸门一旦判断错方向，两种后果都不小 ——
 //   · 判宽了：没登录的人能直接调 /api/at、复位模组；
 //   · 判严了：用户被挡在自己的设备中心外面。
-// 所以判定逻辑（会话解析、白名单、本机免登、缓存）都单独锁一遍。
+// 所以判定逻辑（会话解析、白名单、失败处理、缓存）都单独锁一遍。
 
 import (
 	"encoding/json"
@@ -34,7 +34,7 @@ func withLuciAuth(t *testing.T, valid func(sid string) bool) *int {
 	luciauth.LuciUBusOnce.Do(func() {}) // 先消耗掉 Once，下面直接写缓存值
 	luciauth.LuciUBusPath = "/bin/ubus"
 	calls := 0
-	luciauth.LuciSessionCheck = func(sid string) bool { calls++; return valid(sid) }
+	luciauth.LuciSessionCheck = func(sid string) (bool, error) { calls++; return valid(sid), nil }
 	luciauth.ResetLuciSessionCache()
 	luciauth.ResetLoginLimiter()
 	t.Cleanup(func() {
@@ -48,7 +48,7 @@ func withLuciAuth(t *testing.T, valid func(sid string) bool) *int {
 }
 
 // TestLuciSessionGetOK 解析 `ubus call session get` 的应答。
-// 关键区分：**空的 values = 这个会话没了**（要拒绝）；**解析不了 = 字段名变了**（不能当成拒绝）。
+// 关键区分：**空的 values = 这个会话没了**（要拒绝）；**解析不了 = 字段名变了**（应报告服务不可用）。
 func TestLuciSessionGetOK(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cases := []struct {
@@ -59,7 +59,7 @@ func TestLuciSessionGetOK(t *testing.T) {
 	}{
 		{"登录中的会话", `{"values":{"username":"root","uid":0},"acls":{}}`, true, true},
 		{"没有这个会话（rpcd 对未知 sid 回空 values）", `{"values":{},"acls":{}}`, false, true},
-		{"空对象", `{}`, false, true},
+		{"空对象", `{}`, false, false},
 		{"带 access:false 但没 username", `{"values":{},"acls":{},"access":false}`, false, true},
 		{"username 为空串", `{"values":{"username":"  "}}`, false, true},
 		{"已过期", `{"values":{"username":"root"},"expires":1699999999}`, false, true},
@@ -95,7 +95,7 @@ func TestLuciSessionIDLooksValid(t *testing.T) {
 func TestLuciAuthAllowPath(t *testing.T) {
 	allow := []string{"/", "/index.html", "/mini", "/layouts/standard.css", "/api/version",
 		"/api/login", "/api/logout", "/api/session"}
-	deny := []string{"/api/modems", "/api/at", "/api/version/x", "/ws", "/api/sms/read", "/api/login/x"}
+	deny := []string{"/api/modems", "/api/at", "/api/version/x", "/ws", "/display/ws", "/api/sms/read", "/api/login/x"}
 	for _, p := range allow {
 		if !luciauth.LuciAuthAllowPath(p) {
 			t.Errorf("%s 应放行", p)
@@ -104,27 +104,6 @@ func TestLuciAuthAllowPath(t *testing.T) {
 	for _, p := range deny {
 		if luciauth.LuciAuthAllowPath(p) {
 			t.Errorf("%s 应要求会话", p)
-		}
-	}
-}
-
-func TestLuciAuthLoopback(t *testing.T) {
-	cases := []struct {
-		addr string
-		want bool
-	}{
-		{"127.0.0.1:5555", true},
-		{"[::1]:80", true},
-		{"localhost:80", true},
-		{"192.168.77.228:5000", false},
-		{"10.20.247.16:1234", false},
-		{"", false},
-	}
-	for _, c := range cases {
-		r := httptest.NewRequest("GET", "/api/modems", nil)
-		r.RemoteAddr = c.addr
-		if got := luciauth.LuciAuthLoopback(r); got != c.want {
-			t.Errorf("RemoteAddr=%q: luciAuthLoopback = %v，想要 %v", c.addr, got, c.want)
 		}
 	}
 }
@@ -156,7 +135,7 @@ func gateHandler() http.Handler {
 
 func doGate(t *testing.T, path, cookieName, cookieVal, remote string) *httptest.ResponseRecorder {
 	t.Helper()
-	r := httptest.NewRequest("GET", path, nil)
+	r := httptest.NewRequest("GET", "https://example.test"+path, nil)
 	if remote != "" {
 		r.RemoteAddr = remote
 	}
@@ -193,8 +172,9 @@ func TestLuciAuthGate(t *testing.T) {
 		{"版本接口放行", "/api/version", "", "", "", http.StatusOK},
 		{"静态页面放行（要能打开才有地方提示登录）", "/", "", "", "", http.StatusOK},
 		{"/mini 放行（LuCI 小组件的 iframe）", "/mini", "", "", "", http.StatusOK},
-		{"本机请求免登录", "/api/modems", "", "", "127.0.0.1:5555", http.StatusOK},
-		{"::1 也免登录", "/api/at", "", "", "[::1]:4444", http.StatusOK},
+		{"本机也要登录", "/api/modems", "", "", "127.0.0.1:5555", http.StatusUnauthorized},
+		{"IPv6 回环也要登录", "/api/at", "", "", "[::1]:4444", http.StatusUnauthorized},
+		{"屏幕推送也要会话", "/display/ws", "", "", "", http.StatusUnauthorized},
 	}
 	for _, c := range cases {
 		w := doGate(t, c.path, c.cookie, c.value, c.remote)
@@ -239,7 +219,7 @@ func TestLuciAuthGateLuciSIDParam(t *testing.T) {
 	// 带参数的请求：path 里已经含 ?luci_sid=…（httptest.NewRequest 会把 query 解出来）
 	doGateURL := func(path string, header string, cookies ...[2]string) *httptest.ResponseRecorder {
 		t.Helper()
-		r := httptest.NewRequest("GET", path, nil)
+		r := httptest.NewRequest("GET", "https://example.test"+path, nil)
 		if header != "" {
 			r.Header.Set(luciauth.LuciSIDHeader, header)
 		}
@@ -305,7 +285,7 @@ func TestRegisterRoutesWrappedByLuciAuth(t *testing.T) {
 
 	// 业务接口要会话
 	w2 := httptest.NewRecorder()
-	h.ServeHTTP(w2, httptest.NewRequest("GET", "/api/modems", nil))
+	h.ServeHTTP(w2, httptest.NewRequest("GET", "https://example.test/api/modems", nil))
 	if w2.Code != http.StatusUnauthorized {
 		t.Errorf("RegisterRoutes 必须套上中间件（未登录应 401），实际 %d body=%s", w2.Code, w2.Body.String())
 	}
@@ -327,25 +307,38 @@ func TestLuciAuthDisabledWhenConfigOff(t *testing.T) {
 	}
 }
 
-// TestLuciAuthDisabledWithoutUbus：非 OpenWrt（比如 Windows 上跑 modemd）没有 ubus ⇒
-// 整体不启用 —— 否则本地开发/调试会被自己的鉴权挡在外面。
-func TestLuciAuthDisabledWithoutUbus(t *testing.T) {
-	old := config.Cfg.UI.RequireLuciLogin
-	oldLook, oldPath := luciauth.LuciUbusLookPath, luciauth.LuciUBusPath
-	config.Cfg.UI.RequireLuciLogin = true
-	luciauth.LuciUbusLookPath = func() string { return "" }
-	luciauth.LuciUBusOnce.Do(func() {})
+func TestLuciAuthUnavailableWithoutUbus(t *testing.T) {
+	calls := withLuciAuth(t, func(string) bool { return true })
 	luciauth.LuciUBusPath = ""
-	defer func() {
-		config.Cfg.UI.RequireLuciLogin = old
-		luciauth.LuciUbusLookPath, luciauth.LuciUBusPath = oldLook, oldPath
-	}()
 
-	if luciauth.LuciAuthEnabled() {
-		t.Fatal("没有 ubus 时不该启用")
+	if !luciauth.LuciAuthEnabled() {
+		t.Fatal("缺少 ubus 时仍应要求登录")
 	}
-	if w := doGate(t, "/api/modems", "", "", ""); w.Code != http.StatusOK {
-		t.Errorf("没有 ubus 时应放行，实际 %d", w.Code)
+	for _, sid := range []string{"", testSID} {
+		w := doGate(t, "/api/modems", luciauth.ModemdSessCookie, sid, "")
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("缺少 ubus 时应返回 503，实际 %d", w.Code)
+		}
+	}
+	if *calls != 0 {
+		t.Fatalf("缺少 ubus 时仍尝试了 %d 次会话查询", *calls)
+	}
+}
+
+func TestLuciAuthDoesNotCacheBackendErrors(t *testing.T) {
+	withLuciAuth(t, func(string) bool { return true })
+	calls := 0
+	luciauth.LuciSessionCheck = func(string) (bool, error) {
+		calls++
+		if calls == 1 {
+			return false, errors.New("backend timeout")
+		}
+		return true, nil
+	}
+	for _, want := range []int{http.StatusServiceUnavailable, http.StatusOK} {
+		if w := doGate(t, "/api/modems", luciauth.ModemdSessCookie, testSID, ""); w.Code != want {
+			t.Fatalf("HTTP %d，想要 %d", w.Code, want)
+		}
 	}
 }
 
@@ -354,15 +347,19 @@ func TestLuciAuthDisabledWithoutUbus(t *testing.T) {
 func TestLuciSessionValidCaches(t *testing.T) {
 	calls := withLuciAuth(t, func(sid string) bool { return sid == testSID })
 
-	if !luciauth.LuciSessionValid(testSID) || !luciauth.LuciSessionValid(testSID) {
-		t.Fatal("有效会话应连续两次都通过")
+	for i := 0; i < 2; i++ {
+		if ok, err := luciauth.LuciSessionValid(testSID); !ok || err != nil {
+			t.Fatalf("有效会话校验失败：ok=%v, err=%v", ok, err)
+		}
 	}
 	if *calls != 1 {
 		t.Errorf("有效结果应被缓存，实际问了 %d 次 rpcd", *calls)
 	}
 	bad := "ffffffffffffffffffffffffffffffff"
-	if luciauth.LuciSessionValid(bad) || luciauth.LuciSessionValid(bad) {
-		t.Fatal("无效会话应连续两次都不通过")
+	for i := 0; i < 2; i++ {
+		if ok, err := luciauth.LuciSessionValid(bad); ok || err != nil {
+			t.Fatalf("无效会话校验结果：ok=%v, err=%v", ok, err)
+		}
 	}
 	if *calls != 2 {
 		t.Errorf("无效结果也要缓存（不能让无效 cookie 猛刷 ubus），实际问了 %d 次", *calls)
@@ -382,7 +379,7 @@ func findCookie(w *httptest.ResponseRecorder, name string) *http.Cookie {
 }
 
 func postJSONBody(h http.Handler, path, body string, cookie *http.Cookie) *httptest.ResponseRecorder {
-	r := httptest.NewRequest("POST", path, strings.NewReader(body))
+	r := httptest.NewRequest("POST", "https://example.test"+path, strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	if cookie != nil {
 		r.AddCookie(cookie)
@@ -393,7 +390,7 @@ func postJSONBody(h http.Handler, path, body string, cookie *http.Cookie) *httpt
 }
 
 func getReq(h http.Handler, path string, cookie *http.Cookie) *httptest.ResponseRecorder {
-	r := httptest.NewRequest("GET", path, nil)
+	r := httptest.NewRequest("GET", "https://example.test"+path, nil)
 	if cookie != nil {
 		r.AddCookie(cookie)
 	}
@@ -491,8 +488,8 @@ func TestApiLogin(t *testing.T) {
 	if ck == nil || ck.Value != testSID {
 		t.Fatalf("应下发 %s=<sid> 的 cookie，实际 %+v", luciauth.ModemdSessCookie, ck)
 	}
-	if !ck.HttpOnly || ck.Path != "/" {
-		t.Errorf("会话 cookie 必须 HttpOnly + Path=/：%+v", ck)
+	if !ck.Secure || !ck.HttpOnly || ck.Path != "/" {
+		t.Errorf("会话 cookie 必须设置 Secure、HttpOnly 和 Path=/：%+v", ck)
 	}
 
 	w2 := postJSONBody(h, "/api/login", `{"username":"root","password":"wrong"}`, nil)
@@ -501,6 +498,27 @@ func TestApiLogin(t *testing.T) {
 	}
 	if !strings.Contains(w2.Body.String(), "登录失败") {
 		t.Errorf("应给出失败提示，实际 %s", w2.Body.String())
+	}
+}
+
+func TestLuciAuthPlainHTTPRejectsCredentials(t *testing.T) {
+	stub := withLoginStub(t, "secret")
+	for path, handler := range map[string]http.Handler{
+		"/api/login":  luciauth.ApiLogin(),
+		"/api/modems": luciauth.WrapLuciAuth(gateHandler()),
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"password":"secret"}`))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("X-Forwarded-Proto", "https")
+		req.AddCookie(&http.Cookie{Name: luciauth.ModemdSessCookie, Value: testSID})
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusUpgradeRequired || len(w.Result().Cookies()) != 0 {
+			t.Fatalf("%s: 明文请求应返回 426 且无 Cookie，实际 %d", path, w.Code)
+		}
+	}
+	if stub.logins != 0 {
+		t.Fatal("明文请求的密码进入了 rpcd")
 	}
 }
 
@@ -564,13 +582,13 @@ func TestApiSession(t *testing.T) {
 		t.Errorf("应同时说明闸门是开着的，实际 %s", w.Body.String())
 	}
 
-	// 本机免登录
-	r := httptest.NewRequest("GET", "/api/session", nil)
+	// 回环地址也需要会话。
+	r := httptest.NewRequest("GET", "https://example.test/api/session", nil)
 	r.RemoteAddr = "127.0.0.1:5555"
 	w3 := httptest.NewRecorder()
 	h.ServeHTTP(w3, r)
-	if !strings.Contains(w3.Body.String(), `"local":true`) {
-		t.Errorf("本机应报免登录，实际 %s", w3.Body.String())
+	if !strings.Contains(w3.Body.String(), `"logged_in":false`) {
+		t.Errorf("本机无会话时应报未登录，实际 %s", w3.Body.String())
 	}
 }
 
@@ -598,8 +616,13 @@ func TestLuCIEnvValues(t *testing.T) {
 // （用户 2026-10-06 要求：外面已经要登录了，短信再要一次密码是重复保护）。
 func TestSMSPasswordOffWhenOuterAuthOn(t *testing.T) {
 	oldReq := config.Cfg.UI.SMSPasswordRequired
+	oldLuci := config.Cfg.UI.RequireLuciLogin
 	config.Cfg.UI.SMSPasswordRequired = true
-	t.Cleanup(func() { config.Cfg.UI.SMSPasswordRequired = oldReq })
+	config.Cfg.UI.RequireLuciLogin = false
+	t.Cleanup(func() {
+		config.Cfg.UI.SMSPasswordRequired = oldReq
+		config.Cfg.UI.RequireLuciLogin = oldLuci
+	})
 
 	// 闸门关着（默认）⇒ 短信密码照旧生效
 	if !smsPasswordRequired() {
@@ -619,8 +642,13 @@ func TestSMSPasswordOffWhenOuterAuthOn(t *testing.T) {
 // （界面据此把「访问密码」卡说成“已由路由器登录保护”，而不是“谁都能看”）。
 func TestSMSPAuthReportsOuterAuth(t *testing.T) {
 	oldReq := config.Cfg.UI.SMSPasswordRequired
+	oldLuci := config.Cfg.UI.RequireLuciLogin
 	config.Cfg.UI.SMSPasswordRequired = true
-	t.Cleanup(func() { config.Cfg.UI.SMSPasswordRequired = oldReq })
+	config.Cfg.UI.RequireLuciLogin = false
+	t.Cleanup(func() {
+		config.Cfg.UI.SMSPasswordRequired = oldReq
+		config.Cfg.UI.RequireLuciLogin = oldLuci
+	})
 
 	w := getReq(APIAuth(), "/api/sms/auth", nil)
 	if !strings.Contains(w.Body.String(), `"required":true`) ||

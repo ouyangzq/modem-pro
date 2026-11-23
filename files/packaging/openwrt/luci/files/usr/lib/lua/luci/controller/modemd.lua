@@ -53,7 +53,7 @@ function index()
 		local host = http.getenv("SERVER_NAME") or http.getenv("HTTP_HOST") or ""
 		host = tostring(host):gsub(":%d+$", "")
 		if host == "" then host = "192.168.1.1" end
-		return "http://" .. host .. ":" .. MM.modemdPort() .. "/"
+		return "https://" .. host .. ":" .. MM.modemdPort() .. "/"
 	end
 	_G.modemdConfigIntervals = function()
 		local MM = require("luci.controller.modemd")
@@ -81,7 +81,7 @@ function index()
 	M.controller_ready = true
 end
 
--- modemdPort 读 /etc/modemd/config.toml 的 [server] listen（默认 "0.0.0.0:9527"）。
+-- modemdPort 读 /etc/modemd/config.toml 的 [server] listen（默认 "127.0.0.1:9527"）。
 -- （写成模块函数而不是文件级 local，见文件头规矩 1）
 -- ⚠️ config.toml 里有**两个** listen：`[server] listen` 是地址，`[wechat] listen = true` 是布尔开关
 --    ⇒ 必须只在 [server] 段里找，不能全文匹配第一个 ":端口"。

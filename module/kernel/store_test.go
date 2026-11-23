@@ -440,24 +440,34 @@ func TestStoreAddAndRoundTrip(t *testing.T) {
 	}
 }
 
-// 换 USB 口（端口号变了）但 IMEI 唯一匹配 → 记录要迁移过去
-func TestStoreMigratesByUniqueIMEI(t *testing.T) {
+func TestStoreKeepsQuotaSeparateForSameIMEI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.json")
 	q := NewQuotaStore()
-	q.Init("") // 不落盘
-	q.AddBytes("port:COM1", "IMEI-A", 10, 20)
+	q.Init(path)
+	const imei = "SAME"
+	q.Update("port:COM1", imei, func(s *State) {
+		s.Enabled, s.Blocked = true, true
+		s.UsedDown = 4096
+	})
+	q.AddBytes("port:COM2", imei, 10, 20)
+	q.Flush()
 
-	got := q.Get("port:COM9", "IMEI-A")
-	if got.UsedUp != 10 || got.UsedDown != 20 {
-		t.Fatalf("记录未按 IMEI 迁移: %+v", got)
-	}
-	if old := q.Get("port:COM1", ""); old.UsedUp != 0 {
-		t.Errorf("旧键应已删除，实际 %+v", old)
+	reloaded := NewQuotaStore()
+	reloaded.Init(path)
+	for _, store := range []*QuotaStore{q, reloaded} {
+		other := store.Get("port:COM2", imei)
+		if other.Enabled || other.Blocked || other.UsedUp != 10 || other.UsedDown != 20 {
+			t.Fatalf("第二端口继承了第一端口的配额状态：%+v", other)
+		}
+		original := store.Get("port:COM1", imei)
+		if !original.Enabled || !original.Blocked || original.UsedDown != 4096 {
+			t.Fatalf("第一端口的原记录发生变化：%+v", original)
+		}
 	}
 }
 
-// IMEI 不唯一（两台模组回报同一个 IMEI，实测本机两块 RM502Q-GL 就是这样）→ 绝不迁移，
-// 宁可从零开始也不能串台。（两条记录必须同时存在才叫"不唯一"，所以直接造文件。）
-func TestStoreNoMigrationWhenIMEIAmbiguous(t *testing.T) {
+// 已有的端口记录按原键载入，新端口单独计量。
+func TestStoreRetainsLegacyPortRecords(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "quota.json")
 	seed := `{"version":1,"modems":{

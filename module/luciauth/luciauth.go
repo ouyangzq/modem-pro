@@ -25,11 +25,7 @@ package luciauth
 // 默认**开**（`[ui] require_luci_login`）：用户 2026-10-06 定的口径 ——「默认打开，没有配置也是打开」。
 // 配置文件里**没有这一行**（从旧版升级上来的机器就是这么回事）也算开；
 // 只有显式写 `require_luci_login = false`（LuCI「服务控制」页那个开关写的就是它）才是关。
-// 打开后仍有三道"别把自己锁死"的保险：
-//   · 127.0.0.1 免登录（本机脚本 / 排障 / 打包自检）；
-//   · 这台机器上找不到 ubus（非 OpenWrt，比如 Windows 上跑 modemd）⇒ 整体不启用；
-//   · ubus 调不起来（超时 / rpcd 挂了）⇒ 放行并留日志，只有"rpcd 明确回答没这个会话"
-//     才拒绝（见 luciSessionValidQuery 的注释）。
+// 受保护接口需要 HTTPS 和有效会话。rpcd 不可用时返回 503。
 //
 // 放行不等于没风险：/api/version、/api/login、/api/logout 与静态页面（/、/mini、/layouts/*）
 // 永远放行 —— 要能打开页面才谈得上登录；版本号不敏感（排障用）；
@@ -46,6 +42,7 @@ import (
 	"modemd/module/httpx"
 	"net"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
@@ -102,8 +99,7 @@ var (
 	// LuciUBusOnce/LuciUBusPath 缓存 ubus 的路径（LookPath 只做一次；空串 = 没有）
 	LuciUBusOnce sync.Once
 	LuciUBusPath string
-	// LuciUbusLookPath 实际去找 ubus 的函数（抽成变量：单测要假装“这台机器上有 ubus”，
-	// 否则在 Windows 上跑测试时中间件永远是关闭的，测不到闸门）
+	// LuciUbusLookPath 查找 ubus，可在测试中替换。
 	LuciUbusLookPath = realLuciUbusLookPath
 	// LuciSessionCheck 真正去问 rpcd 的函数（单独抽出来：单测替换它，不依赖真设备）
 	LuciSessionCheck = luciSessionQuery
@@ -122,15 +118,9 @@ func realLuciUbusLookPath() string {
 	return ""
 }
 
-// LuciAuthEnabled 当前是否启用「跟随 LuCI 登录」：
-// 配置里开着（**没写这一行也算开着**，见 config.go 的 Load）+ 这台机器上确实有 ubus
-// （非 OpenWrt / Windows 上跑 modemd 就没有 ⇒ 不启用）。
-// 要关：LuCI「服务控制」页的开关，或把 `[ui] require_luci_login = false` 写进 config.toml。
+// LuciAuthEnabled reports whether the configuration requires a LuCI session.
 func LuciAuthEnabled() bool {
-	if !config.Cfg.UI.RequireLuciLogin {
-		return false
-	}
-	return luciUbusBinary() != ""
+	return config.Cfg.UI.RequireLuciLogin
 }
 
 // luciUbusBinary 找 ubus 可执行文件（只找一次）。
@@ -193,7 +183,7 @@ func ResetLuciSessionCache() {
 }
 
 // LuciSessionValid 校验会话 ID 是否还有效（带短缓存）。
-func LuciSessionValid(sid string) bool {
+func LuciSessionValid(sid string) (bool, error) {
 	now := time.Now()
 	luciSessionMu.Lock()
 	e, hit := luciSessionCache[sid]
@@ -204,11 +194,14 @@ func LuciSessionValid(sid string) bool {
 			ttl = luciSessionOKTTL
 		}
 		if now.Sub(e.at) < ttl {
-			return e.ok
+			return e.ok, nil
 		}
 	}
 
-	ok := LuciSessionCheck(sid)
+	ok, err := LuciSessionCheck(sid)
+	if err != nil {
+		return false, err
+	}
 
 	luciSessionMu.Lock()
 	if len(luciSessionCache) >= luciSessionMaxCache {
@@ -216,52 +209,36 @@ func LuciSessionValid(sid string) bool {
 	}
 	luciSessionCache[sid] = luciSessionEntry{ok: ok, at: time.Now()}
 	luciSessionMu.Unlock()
-	return ok
+	return ok, nil
 }
 
-// luciSessionQuery 真的去问 rpcd：`ubus call session get '{"ubus_rpc_session":"<sid>"}'`
-//
-// 三种结果的处理方式（安全性与"别把自己锁死"之间的取舍）：
-//   - 命令正常返回 + 有 username      → 有效
-//   - 命令正常返回 + values 空        → 无效（这就是"没登录 / 会话过期了"）
-//   - 命令根本没跑起来（超时、没权限）→ **放行** + 留日志：rpcd 出问题时不能连设备中心
-//     都进不去；这种"放行"只发生在 ubus 自身不可用时。
-//   - 命令跑了但非零退出 → 按无效处理（rpcd 明确说不行）+ 把 stderr 写日志便于排查。
-func luciSessionQuery(sid string) bool {
+func luciSessionQuery(sid string) (bool, error) {
 	bin := luciUbusBinary()
 	if bin == "" {
-		return true // 没有 ubus：整体不启用（LuciAuthEnabled 已经挡了，这里是兜底）
+		return false, errors.New("ubus executable unavailable")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), luciUbusTimeout)
 	defer cancel()
-	// 参数用 %q 包成 JSON 字符串（sid 已做形状检查，双保险）
+
 	arg := fmt.Sprintf(`{"ubus_rpc_session":%q}`, sid)
-	cmd := exec.CommandContext(ctx, bin, "call", "session", "get", arg)
-	out, err := cmd.Output()
+	out, err := exec.CommandContext(ctx, bin, "call", "session", "get", arg).Output()
 	if err != nil {
 		if ctx.Err() != nil {
-			config.Logger.Warn("luci session check timed out, allowing request",
-				zap.Duration("timeout", luciUbusTimeout))
-			return true
+			return false, ctx.Err()
 		}
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			config.Logger.Warn("luci session check: ubus returned error, treating session as invalid",
-				zap.String("stderr", strings.TrimSpace(string(ee.Stderr))), zap.Error(err))
-			return false
+		var exit *exec.ExitError
+		// An invoked session method reports "(Not found)" on stderr. An
+		// object lookup failure reports "Command failed: Not found" instead.
+		if errors.As(err, &exit) && strings.HasSuffix(strings.TrimSpace(string(exit.Stderr)), "(Not found)") {
+			return false, nil
 		}
-		config.Logger.Warn("luci session check unavailable, allowing request", zap.Error(err))
-		return true
+		return false, fmt.Errorf("ubus session get: %w", err)
 	}
 	ok, known := LuciSessionGetOK(out, time.Now())
 	if !known {
-		// 输出解析不了 = rpcd 的字段名变了（版本差异）。这时候宁可放行 + 大声留日志，
-		// 也不要因为猜错字段把用户锁在自己的设备外面。
-		config.Logger.Warn("luci session check: unparsable output, allowing request",
-			zap.String("out", strings.TrimSpace(string(out))))
-		return true
+		return false, errors.New("unexpected ubus session response")
 	}
-	return ok
+	return ok, nil
 }
 
 // LuciSessionGetOK 解析 `ubus call session get` 的应答。
@@ -272,10 +249,14 @@ func LuciSessionGetOK(out []byte, now time.Time) (bool, bool) {
 		Values  map[string]any `json:"values"`
 		Expires int64          `json:"expires"`
 	}
-	if err := json.Unmarshal(out, &resp); err != nil {
+	if err := json.Unmarshal(out, &resp); err != nil || resp.Values == nil {
 		return false, false
 	}
-	user, _ := resp.Values["username"].(string)
+	rawUser, exists := resp.Values["username"]
+	user, isString := rawUser.(string)
+	if exists && !isString {
+		return false, false
+	}
 	if strings.TrimSpace(user) == "" {
 		// values 里没有 username：这个会话不存在 / 已过期（rpcd 对未知 sid 就回空 values）
 		return false, true
@@ -287,43 +268,16 @@ func LuciSessionGetOK(out []byte, now time.Time) (bool, bool) {
 	return true, true
 }
 
-// LuciAuthAllowPath 这些路径永远放行（不参与会话校验）。
-//
-//   - 静态页面与资源：要能打开页面，才谈得上在页面上提示"请先登录路由器"；
-//   - /api/version：只有一个版本号，未登录也能看（排障时最想知道的就是"装的哪个版本"）；
-//   - /api/login、/api/logout：一个是"发会话"的、一个是"销会话"的，都不能要求先有会话
-//     （登录接口靠限流挡暴力猜密码，见 ApiLogin）；/api/session 只报"你登录了没"，也放行；
-//   - 其它 /api/* 与 /ws：一律要会话（/ws 是推送通道，不放行就不会变成后门）。
+// LuciAuthAllowPath allows the public UI assets and unauthenticated endpoints.
 func LuciAuthAllowPath(p string) bool {
-	if p == "/ws" {
-		return false
-	}
-	if strings.HasPrefix(p, "/api/") {
-		switch p {
-		case "/api/version", "/api/login", "/api/logout", "/api/session":
-			return true
-		}
-		return false
-	}
-	return true
-}
-
-// LuciAuthLoopback 是不是本机请求（127.0.0.1 / ::1）—— 本机免登录。
-//
-// 为什么要有：设备上的脚本、故障排查、打包后的自检都从本机打接口；
-// 而且能从本机发起请求的前提是"已经在设备上"，不存在网络侧越权。
-// ⚠️ 只看 r.RemoteAddr（内核给的，伪造不了）；**故意不看** X-Forwarded-For 之类
-// 可伪造的请求头。
-func LuciAuthLoopback(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	if host == "::1" || host == "localhost" {
+	switch p {
+	case "/", "/ui", "/index.html", "/mini", "/mini.html", "/mini/",
+		"/layouts/standard.css", "/layouts/outline.css", "/layouts/soft.css", "/layouts/panel.css",
+		"/api/version", "/api/login", "/api/logout", "/api/session":
 		return true
+	default:
+		return false
 	}
-	ip := net.ParseIP(strings.Trim(host, "[]"))
-	return ip != nil && ip.IsLoopback()
 }
 
 // LuciLoginURL 给前端"去登录"用的地址：同主机（去掉端口）的 LuCI 登录页。
@@ -331,11 +285,18 @@ func LuciLoginURL(r *http.Request) string {
 	host := r.Host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
 	}
 	if host == "" {
 		return "/cgi-bin/luci/"
 	}
-	return "http://" + host + "/cgi-bin/luci/"
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + host + "/cgi-bin/luci/"
 }
 
 // writeNeedLogin 未登录时的统一应答：HTTP 401 + need_login/login_url。
@@ -356,23 +317,65 @@ func writeNeedLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// WrapLuciAuth 把「跟随 LuCI 登录」套在所有路由外面。
-//
-// 不启用时是纯粹的一层透传（零开销）；启用后按上面的规则放行/拒绝。
+func writeAuthError(w http.ResponseWriter, status int, msg string, needHTTPS bool) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"code": -1, "data": nil, "msg": msg, "need_https": needHTTPS,
+	})
+}
+
+func requireHTTPS(w http.ResponseWriter, r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	writeAuthError(w, http.StatusUpgradeRequired, "请通过 HTTPS 访问设备中心", true)
+	return false
+}
+
+func writeAuthUnavailable(w http.ResponseWriter, err error) {
+	config.Logger.Warn("LuCI session verification unavailable", zap.Error(err))
+	writeAuthError(w, http.StatusServiceUnavailable, "LuCI 登录服务暂时不可用", false)
+}
+
+func requestSessionValid(r *http.Request) (bool, error) {
+	if luciUbusBinary() == "" {
+		return false, errors.New("ubus executable unavailable")
+	}
+	var checkErr error
+	for _, sid := range LuciSessionIDs(r) {
+		ok, err := LuciSessionValid(sid)
+		if ok && err == nil {
+			return true, nil
+		}
+		if err != nil {
+			checkErr = err
+		}
+	}
+	return false, checkErr
+}
+
+// WrapLuciAuth requires HTTPS and a valid session on protected routes.
 func WrapLuciAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !LuciAuthEnabled() || LuciAuthAllowPath(r.URL.Path) || LuciAuthLoopback(r) {
+		if !LuciAuthEnabled() || LuciAuthAllowPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// 只要**任意一个**候选 cookie 有效就放行（同机可能同时存在 http/https 两份）
-		for _, sid := range LuciSessionIDs(r) {
-			if LuciSessionValid(sid) {
-				next.ServeHTTP(w, r)
-				return
-			}
+		if !requireHTTPS(w, r) {
+			return
 		}
-		writeNeedLogin(w, r)
+		valid, err := requestSessionValid(r)
+		if err != nil {
+			writeAuthUnavailable(w, err)
+			return
+		}
+		if !valid {
+			writeNeedLogin(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -403,7 +406,14 @@ var (
 	RpcdLogin   = rpcdSessionLogin
 	RpcdDestroy = rpcdSessionDestroy
 	// ubusHTTPDoer 发 /ubus 请求用的 HTTP 客户端（单测可替换）
-	ubusHTTPDoer = func() *http.Client { return &http.Client{Timeout: luciUbusTimeout} }
+	ubusHTTPDoer = func() *http.Client {
+		return &http.Client{
+			Timeout: luciUbusTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	}
 	// loginTries 登录尝试记录（按来源 IP）
 	loginTries = struct {
 		mu   sync.Mutex
@@ -469,18 +479,18 @@ func forgetLuciSession(sid string) {
 }
 
 // setSessCookie / clearSessCookie 我们的会话 cookie（HttpOnly：JS 读不到，防 XSS 偷会话）
-func setSessCookie(w http.ResponseWriter, r *http.Request, sid string) {
+func setSessCookie(w http.ResponseWriter, sid string) {
 	http.SetCookie(w, &http.Cookie{
 		Name: ModemdSessCookie, Value: sid, Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, MaxAge: luciLoginTimeoutSec,
-		Secure: r.TLS != nil,
+		Secure: true,
 	})
 }
 
-func clearSessCookie(w http.ResponseWriter, r *http.Request) {
+func clearSessCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name: ModemdSessCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1,
-		SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil,
+		SameSite: http.SameSiteLaxMode, Secure: true,
 	})
 }
 
@@ -494,7 +504,17 @@ func ubusRPCCall(obj, method string, args map[string]any) (json.RawMessage, erro
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, ubusHTTPURL(), bytes.NewReader(payload))
+	endpoint, err := url.Parse(ubusHTTPURL())
+	if err != nil || endpoint.Hostname() == "" || endpoint.User != nil {
+		return nil, errors.New("invalid [ui] ubus_http URL")
+	}
+	if endpoint.Scheme != "https" {
+		ip := net.ParseIP(endpoint.Hostname())
+		if endpoint.Scheme != "http" || ip == nil || !ip.IsLoopback() {
+			return nil, errors.New("[ui] ubus_http requires HTTPS or a loopback HTTP address")
+		}
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint.String(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -504,6 +524,9 @@ func ubusRPCCall(obj, method string, args map[string]any) (json.RawMessage, erro
 		return nil, fmt.Errorf("连不上 ubus（%s 打不通，uhttpd 没跑或端口不是 80？）：%w", ubusHTTPURL(), err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ubus HTTP status %d", resp.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return nil, err
@@ -636,6 +659,13 @@ func ApiLogin() http.HandlerFunc {
 			httpx.WriteJSON(w, 0, map[string]any{"auth": false}, "未启用登录校验，无需登录")
 			return
 		}
+		if !requireHTTPS(w, r) {
+			return
+		}
+		if luciUbusBinary() == "" {
+			writeAuthUnavailable(w, errors.New("ubus executable unavailable"))
+			return
+		}
 		var req struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
@@ -662,7 +692,7 @@ func ApiLogin() http.HandlerFunc {
 			httpx.WriteJSON(w, -1, nil, "登录失败："+err.Error())
 			return
 		}
-		setSessCookie(w, r, sid)
+		setSessCookie(w, sid)
 		config.Logger.Info("login ok", zap.String("ip", ip), zap.String("user", user))
 		httpx.WriteJSON(w, 0, map[string]any{"username": user}, "登录成功")
 	}
@@ -673,11 +703,14 @@ func ApiLogin() http.HandlerFunc {
 // 放在放行名单里：会话已经过期时也要能把 cookie 清掉（HttpOnly，JS 自己删不了）。
 func ApiLogout() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !requireHTTPS(w, r) {
+			return
+		}
 		var sid string
 		if c, err := r.Cookie(ModemdSessCookie); err == nil && c != nil {
 			sid = strings.TrimSpace(c.Value)
 		}
-		clearSessCookie(w, r)
+		clearSessCookie(w)
 		if sid != "" && LuciSessionIDLooksValid(sid) {
 			forgetLuciSession(sid)
 			if err := RpcdDestroy(sid); err != nil {
@@ -696,17 +729,18 @@ func ApiSession() http.HandlerFunc {
 			httpx.WriteJSON(w, 0, map[string]any{"auth": false, "logged_in": true}, "未启用登录校验")
 			return
 		}
-		for _, sid := range LuciSessionIDs(r) {
-			if LuciSessionValid(sid) {
-				httpx.WriteJSON(w, 0, map[string]any{"auth": true, "logged_in": true}, "已登录")
-				return
-			}
-		}
-		if LuciAuthLoopback(r) {
-			httpx.WriteJSON(w, 0, map[string]any{"auth": true, "logged_in": true, "local": true},
-				"本机免登录")
+		if !requireHTTPS(w, r) {
 			return
 		}
-		httpx.WriteJSON(w, 0, map[string]any{"auth": true, "logged_in": false}, "未登录")
+		valid, err := requestSessionValid(r)
+		if err != nil {
+			writeAuthUnavailable(w, err)
+			return
+		}
+		msg := "未登录"
+		if valid {
+			msg = "已登录"
+		}
+		httpx.WriteJSON(w, 0, map[string]any{"auth": true, "logged_in": valid}, msg)
 	}
 }

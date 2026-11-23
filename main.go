@@ -18,8 +18,11 @@
 package main
 
 import (
+	"crypto/tls"
+	"fmt"
 	"modemd/module/atport"
 	"modemd/module/config"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -42,6 +45,16 @@ func main() {
 	}
 	config.Init(config.Cfg.Server.LogFile, config.Cfg.Server.LogLevel)
 	defer func() { _ = config.L().Sync() }()
+
+	webConfig := config.Cfg.Server
+	listenAddr, tlsConfig, err := webListenerConfig(webConfig.Listen, webConfig.TLSCertFile, webConfig.TLSKeyFile)
+	if err != nil {
+		logger.Fatal("web server config error", zap.Error(err))
+	}
+	if listenAddr != webConfig.Listen {
+		logger.Warn("web server restricted to loopback until TLS is configured",
+			zap.String("configured", webConfig.Listen), zap.String("listen", listenAddr))
+	}
 
 	if err := config.WritePidFile(config.Cfg.Server.PidFile); err != nil {
 		logger.Fatal("write pid failed", zap.Error(err))
@@ -69,7 +82,11 @@ func main() {
 	atport.InitATPortBinds()
 	// 短信密码：仅提示“还在用默认密码”，避免用户以为自己已经保护上了
 	kernel.LogSMSPasswordHint()
-	srv := &http.Server{Addr: config.Cfg.Server.Listen, Handler: kernel.RegisterRoutes(mgr, apiUI())}
+	srv := &http.Server{
+		Addr:      listenAddr,
+		Handler:   kernel.RegisterRoutes(mgr, apiUI()),
+		TLSConfig: tlsConfig,
+	}
 
 	// 启动时发现一次（否则不知道有哪些模组）
 	kernel.DiscoverAndStart(mgr)
@@ -140,7 +157,8 @@ func main() {
 	}
 
 	logger.Info("modemd started",
-		zap.String("addr", config.Cfg.Server.Listen),
+		zap.String("addr", srv.Addr),
+		zap.Bool("tls", srv.TLSConfig != nil),
 		zap.Int("scan_interval_s", scanSec),
 		zap.Int("push_interval_s", config.Cfg.Server.PushInterval),
 		zap.Int("traffic_interval_s", config.Cfg.Server.TrafficInterval),
@@ -163,7 +181,35 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	serve := srv.ListenAndServe
+	if srv.TLSConfig != nil {
+		serve = func() error { return srv.ListenAndServeTLS("", "") }
+	}
+	if err := serve(); err != nil && err != http.ErrServerClosed {
 		logger.Fatal("http server exit", zap.Error(err))
 	}
+}
+
+func webListenerConfig(addr, certFile, keyFile string) (string, *tls.Config, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid [server] listen address: %w", err)
+	}
+	if certFile == "" && keyFile == "" {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			addr = net.JoinHostPort("127.0.0.1", port)
+		}
+		return addr, nil, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return "", nil, fmt.Errorf("set both [server] tls_cert_file and tls_key_file")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return "", nil, fmt.Errorf("load [server] TLS key pair: %w", err)
+	}
+	return addr, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}, nil
 }
