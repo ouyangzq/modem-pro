@@ -18,8 +18,7 @@ import (
 //
 // ⚠️ 为什么不用 IMEI 当主键：实测本机两块 RM502Q-GL（COM14 / COM16）回报的 IMEI
 // 一模一样（克隆 IMEI 或同一模组的两个 AT 口），按 IMEI 存会让两个模组**共用一份配额**——
-// 给模组 0 设上限，模组 1 跟着被断网。端口号在同一条 USB 通路上是稳定的，换 USB 口时会换号，
-// 那种情况由 QuotaStore.stateLocked 里的“唯一 IMEI 匹配”迁移兼顾。
+// 给模组 0 设上限，模组 1 跟着被断网。配额始终绑定端口，换端口后使用该端口自己的记录。
 func Key(atPort string, modemID int) string {
 	if p := strings.TrimSpace(atPort); p != "" {
 		return "port:" + p
@@ -119,7 +118,7 @@ func (q *QuotaStore) saveLocked() {
 	q.savedAt = time.Now()
 }
 
-// stateLocked 取（或创建）状态记录；顺带处理“换 USB 口”后的迁移和 IMEI 记录
+// stateLocked 按端口取（或创建）状态记录，IMEI 只作记录。
 func (q *QuotaStore) stateLocked(key, imei string) *State {
 	imei = strings.TrimSpace(imei)
 	if st, ok := q.data[key]; ok {
@@ -128,24 +127,6 @@ func (q *QuotaStore) stateLocked(key, imei string) *State {
 			q.dirty = true
 		}
 		return st
-	}
-	// 兼容迁移：端口换了（插到别的 USB 口）但 IMEI 唯一匹配时，把记录搬过来。
-	// 两个模组 IMEI 相同时会有两条候选 → 不搬（宁可从零开始，也不能串台）。
-	if imei != "" {
-		var found []string
-		for k, v := range q.data {
-			if k != key && v.IMEI == imei {
-				found = append(found, k)
-			}
-		}
-		if len(found) == 1 {
-			v := q.data[found[0]]
-			delete(q.data, found[0])
-			q.data[key] = v
-			q.dirty = true
-			logger.Info("quota record migrated", zap.String("from", found[0]), zap.String("to", key))
-			return v
-		}
 	}
 	st := &State{QuotaConfig: QuotaConfig{CountUp: true, CountDown: true, Action: ActionBlock}, IMEI: imei}
 	q.data[key] = st

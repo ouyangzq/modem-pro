@@ -37,6 +37,24 @@ LuCI 侧（`luci-app-modemd-pro`）：`/usr/lib/lua/luci/...`、`/usr/share/ucod
 `/usr/share/luci/menu.d/luci-app-modemd.json`、`/usr/share/rpcd/acl.d/luci-app-modemd.json`、
 `/www/luci-static/resources/modemd/...`。安装脚本会按固件的 LuCI 类型自动只留 Lua 或 JS 一套。
 
+## 设备中心访问
+
+默认监听 `127.0.0.1:9527`。从其他设备访问时，在 `/etc/modemd/config.toml` 的 `[server]`
+中设置监听地址、PEM 证书链和私钥路径。证书的主机名或 IP 应和浏览器地址匹配。
+
+```toml
+[server]
+listen = "0.0.0.0:9527"
+tls_cert_file = "/etc/modemd/server.crt"
+tls_key_file = "/etc/modemd/server.key"
+```
+
+重启 `/etc/init.d/modemd restart` 后，通过 `https://<路由器地址>:9527/` 访问。
+旧配置仍监听非回环地址但没有证书时，服务会在原端口回退到 `127.0.0.1` 并记录日志。
+开启 LuCI 登录时，受保护的 HTTP API 和 WebSocket（包括屏幕推送）要求 HTTPS 和有效会话。
+找不到 `ubus` 的本地开发环境可使用 `config.test.toml`，其中仅对回环监听关闭 LuCI 登录。
+自定义 `ui.ubus_http` 时，使用 HTTPS 或指向回环 IP 的 HTTP 地址。该地址应直接响应 RPC 请求。
+
 ## 编译方法
 
 ```sh

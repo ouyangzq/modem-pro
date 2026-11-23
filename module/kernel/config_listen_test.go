@@ -16,8 +16,8 @@ import (
 )
 
 func TestListenPortDefaultAndOverride(t *testing.T) {
-	if config.DefaultListenAddr != "0.0.0.0:9527" {
-		t.Fatalf("DefaultListenAddr = %q，want 0.0.0.0:9527 —— 改默认端口要同步改前端/文档/打包脚本",
+	if config.DefaultListenAddr != "127.0.0.1:9527" {
+		t.Fatalf("DefaultListenAddr = %q，want 127.0.0.1:9527",
 			config.DefaultListenAddr)
 	}
 

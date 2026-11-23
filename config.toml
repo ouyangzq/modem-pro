@@ -1,7 +1,9 @@
 [server]
 # Web 界面（设备中心）监听地址。**改完必须重启服务**：/etc/init.d/modemd restart
-# 只想本机访问就写 127.0.0.1:9527；端口与 LuCI 的 80 不冲突，别用 80/443。
-listen = "0.0.0.0:9527"
+# 默认只监听本机。启用 LuCI 登录或让其他设备访问时，需要配置 HTTPS。
+listen = "127.0.0.1:9527"
+# tls_cert_file = "/etc/modemd/server.crt"
+# tls_key_file = "/etc/modemd/server.key"
 # 后台热插拔巡检间隔（秒）。**插拔自动检测就靠它**。
 # 0 = 不启用后台周期任务，只在启动时发现一次模组（之后插上的模组不会被发现；
 #     页面的「刷新模组」只读缓存、不重探串口，只能自己调 GET /api/modems?discover=1）。
@@ -272,15 +274,14 @@ sms_password = "password"
 # 开启后：
 #   · 静态页面 / /api/version / /api/session / /api/login / /api/logout 仍放行
 #     （否则连登录都做不了；登录接口靠限流挡暴力猜密码：同 IP 60 秒 5 次）；
-#   · 127.0.0.1（设备本机）免登录 —— 本机脚本 / 排障 / 打包自检不受影响；
-#   · 这台机器上找不到 ubus（非 OpenWrt，比如 Windows 上跑 modemd）时整体不启用；
-#   · ubus 调不起来（超时）时放行并记日志，只有 rpcd 明确回答「没这个会话」才拒绝；
+#   · 受保护接口（包括本机请求）要求 HTTPS 和有效会话。
+#   · ubus 缺失、超时或应答异常时拒绝访问。
 #   · 上面那层短信密码**自动停用**（能调接口的人本来就已经登录过路由器账号了）。
 require_luci_login = true
 
 # ubus 的 HTTP JSON-RPC 端点：登录/退出用它（**密码走请求体，不会出现在 ps 里**）。
 # 留空 = 默认 "http://127.0.0.1/ubus"（= uhttpd 的 ubus_prefix）；
-# uhttpd 改过监听端口/前缀就在这里写全，否则登录会报「连不上 ubus」。
+# uhttpd 改过监听端口或前缀就在这里写全。HTTP 仅支持回环 IP，其他地址必须用 HTTPS。
 # ubus_http = "http://127.0.0.1/ubus"
 
 [wechat]
